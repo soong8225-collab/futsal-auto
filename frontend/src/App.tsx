@@ -47,7 +47,8 @@ type GKResponse = {
   schedules: GKScheduleTeam[];
 };
 
-const API_BASE = "http://localhost:8000";
+const API_BASE = "https://futsal-auto.onrender.com";
+
 
 function uid() {
   return Math.random().toString(36).slice(2, 10);
