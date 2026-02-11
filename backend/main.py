@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Dict, Any, Tuple
 import random
+import math
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,13 +13,12 @@ from pydantic import BaseModel, Field
 # Settings (요청 반영)
 # =========================
 LINE_LIMIT = 10          # 라인(1번vs1번...) 허용 차이
-GK_TOLERANCE = 7         # GK 매칭 ±7 (추후 GK API 개선에 사용 가능)
-SWAP_ITERS = 900         # 스왑 탐색 횟수 (인원 10~25명 정도면 충분히 빠름)
+GK_TOLERANCE = 7         # GK 매칭 ±7
+SWAP_ITERS = 900         # 스왑 탐색 횟수
 
-# 점수 가중치 (체감 밸런스에 라인을 더 중요하게)
 W_SUM = 1.0
 W_LINE = 1.4
-OVER_LIMIT_PENALTY = 8.0  # 라인 제한 초과 시 페널티
+OVER_LIMIT_PENALTY = 8.0
 
 
 # =========================
@@ -80,8 +80,7 @@ class GKScheduleResponse(BaseModel):
 # =========================
 app = FastAPI(title="Futsal Auto Teams")
 
-# NOTE:
-# allow_origins=["*"] 일 때 allow_credentials=True 는 브라우저에서 막힐 수 있어 False로 둡니다.
+# allow_origins=["*"] + allow_credentials=True 는 브라우저에서 충돌 가능 → False
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -108,9 +107,9 @@ def _sorted_ratings(players: List[Player]) -> List[int]:
 
 def _line_penalty_any_k(teams_players: List[List[Player]]) -> float:
     """
-    k팀 일반화 라인 페널티:
-    - 각 팀을 내림차순 정렬했을 때 같은 라인(인덱스)의 max-min 차이를 누적
-    - 차이가 LINE_LIMIT를 넘으면 큰 페널티 추가
+    k팀 라인 페널티:
+    - 각 팀 내림차순 정렬 후 같은 라인(index)의 max-min 차이 누적
+    - 차이가 LINE_LIMIT 넘으면 큰 페널티
     """
     if not teams_players:
         return 0.0
@@ -132,18 +131,12 @@ def _line_penalty_any_k(teams_players: List[List[Player]]) -> float:
         if diff > LINE_LIMIT:
             penalty += (diff - LINE_LIMIT) * OVER_LIMIT_PENALTY
 
-    # 인원수 차이가 큰 경우(기본은 동일 인원으로 만들지만 extras 붙일 수 있으니 약한 페널티)
     sizes = [len(t) for t in teams_players]
     penalty += (max(sizes) - min(sizes)) * 5.0
-
     return penalty
 
 
 def _score_partition(teams_players: List[List[Player]]) -> float:
-    """
-    낮을수록 좋은 팀편성 점수:
-    - 팀 총점 격차 + 라인 매치업 격차
-    """
     sums = [_team_sum(t) for t in teams_players]
     sum_diff = (max(sums) - min(sums)) if sums else 0
     line_pen = _line_penalty_any_k(teams_players)
@@ -154,24 +147,17 @@ def _initial_snake(players_sorted: List[Player], k: int) -> List[List[Player]]:
     """
     초기 편성: 스네이크 드래프트
     - 강한 순서대로 팀 0..k-1, 다음은 k-1..0 반복
-    - base_players는 k로 나누어떨어지게 들어오도록 설계(동일 인원 유지)
     """
     teams = [[] for _ in range(k)]
     forward = True
     idx = 0
     for p in players_sorted:
-        if forward:
-            t = idx
-        else:
-            t = (k - 1) - idx
-
+        t = idx if forward else (k - 1 - idx)
         teams[t].append(p)
-
         idx += 1
         if idx == k:
             idx = 0
             forward = not forward
-
     return teams
 
 
@@ -212,7 +198,7 @@ def _strength_for_handicap(team_players: List[Player]) -> float:
 
 
 # =========================
-# Core: Team generation (라인 + 깍두기)
+# Core: Team generation (라인 + 깍두기 + 인원분배 보장)
 # =========================
 def generate_teams(players: List[Player], k: int) -> List[Team]:
     active_players = [p for p in players if p.active]
@@ -231,35 +217,40 @@ def generate_teams(players: List[Player], k: int) -> List[Team]:
             },
         )
 
-    # 강한 순서대로 정렬
+    # 강한 순 정렬
     active_players = sorted(active_players, key=lambda p: p.rating, reverse=True)
 
-    # -------------------------
-    # (핵심) 깍두기 규칙 준비:
-    # base는 k로 나누어떨어지게 팀 균등 인원 편성
-    # extras(남는 인원)는 최약체부터, "강팀"에 붙여 핸디캡
-    # -------------------------
-    base_size = (len(active_players) // k) * k
-    base_players = active_players[:base_size]
-    extras = sorted(active_players[base_size:], key=lambda p: p.rating)  # 최약체부터
+    # ✅ 인원 분배 목표:
+    # 예) 17명 3팀 -> target_max=6, target_min=5 => 6/6/5만 가능 (7/5/5 불가)
+    n = len(active_players)
+    target_max = (n + k - 1) // k   # ceil(n/k)
+    target_min = n // k            # floor(n/k)
 
-    # base_players로 동일 인원 팀 생성 + 라인 최적화
+    # base는 모두 최소 인원(target_min)씩 채우는 인원
+    base_size = target_min * k
+    base_players = active_players[:base_size]                 # 균등 편성(동일 인원)
+    extras = sorted(active_players[base_size:], key=lambda p: p.rating)  # 남는 인원(최약체부터)
+
+    # base_players로 균등 팀 만들고 라인 최적화
     teams_players = _initial_snake(base_players, k)
     teams_players = _try_improve_by_swaps(teams_players, iterations=SWAP_ITERS)
-
-    # 팀 내부 정렬(라인 비교 정확히)
     teams_players = [sorted(t, key=lambda p: p.rating, reverse=True) for t in teams_players]
 
-    # -------------------------
-    # (핵심) 깍두기 적용:
-    # 남는 인원은 항상 "강팀"이 가져간다
-    # -------------------------
+    # ✅ (핵심) extras 배정:
+    # - 강팀부터 주되,
+    # - 어떤 팀도 target_max(ceil) 넘지 않게
+    # -> 결과 인원은 항상 target_max/target_min 조합으로만 나옵니다.
     for extra in extras:
-        strongest_idx = max(range(k), key=lambda i: _strength_for_handicap(teams_players[i]))
+        candidates = [i for i in range(k) if len(teams_players[i]) < target_max]
+        if not candidates:
+            # 이론상 거의 없음(안전장치)
+            candidates = list(range(k))
+
+        strongest_idx = max(candidates, key=lambda i: _strength_for_handicap(teams_players[i]))
         teams_players[strongest_idx].append(extra)
         teams_players[strongest_idx].sort(key=lambda p: p.rating, reverse=True)
 
-    # Team 모델로 패킹
+    # Team 모델 패킹
     teams: List[Team] = []
     for i, ps in enumerate(teams_players):
         s = sum(p.rating for p in ps)
@@ -278,9 +269,9 @@ def generate_teams(players: List[Player], k: int) -> List[Team]:
 
 
 # =========================
-# GK schedule (기존 유지)
-# - 지금 단계에서는 팀편성/깍두기 먼저
-# - 이후 2팀일 때 GK 라인매칭(±7)로 개선 가능
+# GK Schedule
+# - 기본: 팀별 라운드로빈
+# - 개선: "2팀일 때" 라인/능력치 매칭 + ±7 + 사용횟수 균등
 # =========================
 def build_gk_schedule_for_team(team: Team, match_minutes: int, seg_minutes: int) -> GKScheduleTeam:
     eligible = [p for p in team.players if not p.noGK]
@@ -329,6 +320,135 @@ def build_gk_schedule_for_team(team: Team, match_minutes: int, seg_minutes: int)
     )
 
 
+def _pick_least_used(eligible_sorted: List[Player], used: Dict[str, int], pointer: int) -> Tuple[Optional[Player], int]:
+    if not eligible_sorted:
+        return None, pointer
+
+    min_used = min(used.get(p.id, 0) for p in eligible_sorted)
+    candidates = [p for p in eligible_sorted if used.get(p.id, 0) == min_used]
+    p = candidates[pointer % len(candidates)]
+    pointer += 1
+    return p, pointer
+
+
+def _pick_match(
+    eligible_sorted: List[Player],
+    used: Dict[str, int],
+    target_rating: int,
+    tol: int = GK_TOLERANCE,
+) -> Optional[Player]:
+    if not eligible_sorted:
+        return None
+
+    within = [p for p in eligible_sorted if abs(p.rating - target_rating) <= tol]
+    pool = within if within else eligible_sorted
+
+    pool_sorted = sorted(
+        pool,
+        key=lambda p: (used.get(p.id, 0), abs(p.rating - target_rating))
+    )
+    return pool_sorted[0] if pool_sorted else None
+
+
+def build_gk_schedule_two_teams(
+    team_a: Team,
+    team_b: Team,
+    match_minutes: int,
+    seg_minutes: int,
+    tol: int = GK_TOLERANCE,
+) -> List[GKScheduleTeam]:
+    if seg_minutes <= 0:
+        seg_minutes = 2
+
+    eligible_a = sorted([p for p in team_a.players if not p.noGK], key=lambda p: p.rating, reverse=True)
+    eligible_b = sorted([p for p in team_b.players if not p.noGK], key=lambda p: p.rating, reverse=True)
+
+    used_a: Dict[str, int] = {}
+    used_b: Dict[str, int] = {}
+
+    warn_a = None
+    warn_b = None
+    if len(eligible_a) == 0:
+        warn_a = "GK 가능한 선수가 0명입니다(noGK 체크 확인 필요)."
+    elif len(eligible_a) == 1:
+        warn_a = "GK 가능한 선수가 1명뿐이라 반복 배정됩니다."
+
+    if len(eligible_b) == 0:
+        warn_b = "GK 가능한 선수가 0명입니다(noGK 체크 확인 필요)."
+    elif len(eligible_b) == 1:
+        warn_b = "GK 가능한 선수가 1명뿐이라 반복 배정됩니다."
+
+    seg_count = math.ceil(match_minutes / seg_minutes)
+
+    segs_a: List[GKSegment] = []
+    segs_b: List[GKSegment] = []
+
+    ptr_a = 0
+    ptr_b = 0
+
+    for s in range(seg_count):
+        start = s * seg_minutes
+        end = min(start + seg_minutes, match_minutes)
+        dur = end - start
+
+        # anchor를 번갈아가며 (공평)
+        if s % 2 == 0:
+            # A anchor
+            anchor, ptr_a = _pick_least_used(eligible_a, used_a, ptr_a)
+            if anchor is None:
+                a_id, a_name, a_rating = None, "없음", 0
+            else:
+                a_id, a_name, a_rating = anchor.id, anchor.name, anchor.rating
+                used_a[a_id] = used_a.get(a_id, 0) + 1
+
+            match = _pick_match(eligible_b, used_b, a_rating, tol=tol)
+            if match is None:
+                b_id, b_name = None, "없음"
+            else:
+                b_id, b_name = match.id, match.name
+                used_b[b_id] = used_b.get(b_id, 0) + 1
+
+        else:
+            # B anchor
+            anchor, ptr_b = _pick_least_used(eligible_b, used_b, ptr_b)
+            if anchor is None:
+                b_id, b_name, b_rating = None, "없음", 0
+            else:
+                b_id, b_name, b_rating = anchor.id, anchor.name, anchor.rating
+                used_b[b_id] = used_b.get(b_id, 0) + 1
+
+            match = _pick_match(eligible_a, used_a, b_rating, tol=tol)
+            if match is None:
+                a_id, a_name = None, "없음"
+            else:
+                a_id, a_name = match.id, match.name
+                used_a[a_id] = used_a.get(a_id, 0) + 1
+
+        segs_a.append(
+            GKSegment(
+                startMin=start,
+                endMin=end,
+                durationMin=dur,
+                gkPlayerId=a_id,
+                gkPlayerName=a_name,
+            )
+        )
+        segs_b.append(
+            GKSegment(
+                startMin=start,
+                endMin=end,
+                durationMin=dur,
+                gkPlayerId=b_id,
+                gkPlayerName=b_name,
+            )
+        )
+
+    return [
+        GKScheduleTeam(teamName=team_a.name, eligibleCount=len(eligible_a), segments=segs_a, warning=warn_a),
+        GKScheduleTeam(teamName=team_b.name, eligibleCount=len(eligible_b), segments=segs_b, warning=warn_b),
+    ]
+
+
 # =========================
 # Routes
 # =========================
@@ -351,8 +471,6 @@ def api_generate_teams(req: GenerateTeamsRequest):
         "maxSum": max_sum,
         "minSum": min_sum,
         "diff": max_sum - min_sum,
-        # 참고용: 라인 패널티도 같이 보고 싶으면 아래 주석 해제 가능
-        # "linePenalty": _line_penalty_any_k([t.players for t in teams]),
     }
 
     return GenerateTeamsResponse(teams=teams, balance=balance)
@@ -360,5 +478,17 @@ def api_generate_teams(req: GenerateTeamsRequest):
 
 @app.post("/api/gk/schedule", response_model=GKScheduleResponse)
 def api_gk_schedule(req: GKScheduleRequest):
+    # ✅ 2팀일 때만 "라인 매칭 GK(±7)" 적용
+    if len(req.teams) == 2:
+        schedules = build_gk_schedule_two_teams(
+            req.teams[0],
+            req.teams[1],
+            req.matchMinutes,
+            req.segmentMinutes,
+            tol=GK_TOLERANCE,
+        )
+        return GKScheduleResponse(schedules=schedules)
+
+    # 3팀 이상은 기존 로테이션 유지(대진표가 없어서)
     schedules = [build_gk_schedule_for_team(t, req.matchMinutes, req.segmentMinutes) for t in req.teams]
     return GKScheduleResponse(schedules=schedules)
